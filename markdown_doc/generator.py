@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
 from types import FunctionType, MethodType, ModuleType
-from typing import Any, Callable, NewType, TypeGuard
+from typing import Any, Callable, Mapping, NewType, TypeGuard
 
 from docsource.docstring import DocstringSeeAlso, check_docstring, parse_type
 from docsource.enumeration import enum_labels
@@ -123,6 +123,23 @@ def quote_value(value: Any) -> str:
         return f"```{s}```"
 
 
+def _yaml_scalar(s: str) -> str:
+    """
+    Renders a string as a YAML scalar, double-quoting it if it contains characters that are significant in YAML flow
+    context or would otherwise be misinterpreted (e.g. a leading indicator character, a `: ` or ` #` sequence).
+    """
+
+    if s == "":
+        return '""'
+    needs_quotes = (
+        s != s.strip() or ": " in s or " #" in s or s[0] in "!&*?|>%@`\"'#,[]{}:-" or s.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
+    )
+    if not needs_quotes:
+        return s
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
 def type_name(tp: NewType | type[Any]) -> str:
     return tp.__name__  # type: ignore[union-attr]
 
@@ -168,6 +185,29 @@ def module_path(target: str, source: str) -> str:
 
     target_path = Path("/" + target.replace(".", "/") + ".md")
     source_path = Path("/" + source.replace(".", "/") + ".md")
+    target_dir = target_path.parent
+    source_dir = source_path.parent
+    if sys.version_info >= (3, 12):
+        relative_path = Path(target_dir).relative_to(source_dir, walk_up=True)
+    else:
+        relative_path = Path(os.path.relpath(target_dir, start=source_dir))
+    return (relative_path / target_path.name).as_posix()
+
+
+def _relative_md_path(target: str, source: str) -> str:
+    """
+    Returns a relative path from one output file to another, given their on-disk file names.
+
+    Unlike :func:`module_path`, which derives a file system path from a dotted module name, this function operates on
+    arbitrary output file names (as supplied via a routing file-metadata registry), which may themselves contain
+    POSIX-style subdirectories.
+
+    :param target: The output file name to link to (POSIX-style, relative to the target directory).
+    :param source: The output file name to link from (POSIX-style, relative to the target directory).
+    """
+
+    target_path = Path("/" + target)
+    source_path = Path("/" + source)
     target_dir = target_path.parent
     source_dir = source_path.parent
     if sys.version_info >= (3, 12):
@@ -238,6 +278,91 @@ def object_kind(cls: ObjectType | ModuleType) -> ObjectKind:
         return ObjectKind.CLASS
 
 
+RouteKey = str
+"Opaque key identifying a routed output file. Multiple objects (possibly from different modules) sharing a key are emitted into the same file."
+
+SectionKey = str
+"Opaque key identifying an ordered section within a routed output file. Section order is set via `FileMeta.section_order`."
+
+RoutedKey = RouteKey | tuple[RouteKey, SectionKey]
+"Routing callable result: an output file key, or a (file key, section key) pair to also place the object in a section."
+
+RouteFn = Callable[[ObjectType], RoutedKey | None]
+"Maps a documented object to a routed output file key (optionally with a section key), or `None` to exclude the object from output."
+
+
+def _split_routed_key(routed: RoutedKey) -> tuple[RouteKey, SectionKey | None]:
+    "Normalizes a routing callable's return value into a (file key, section key) pair; a bare key has no section."
+
+    if isinstance(routed, tuple):
+        return routed
+    return (routed, None)
+
+
+@dataclass
+class FileMeta:
+    """
+    Metadata describing a routed output file.
+
+    :param filename: Output file name relative to the target directory, e.g. `dataset-canvas.md`. May contain
+        POSIX-style subdirectories, which are created on demand. Must not be absolute or contain `..` segments.
+    :param title: Heading (H1) text for the file. Defaults to the routing key if omitted.
+    :param front_matter: Key/value pairs emitted as a leading YAML front-matter block, before the heading.
+    :param section_order: Order in which sections (identified by the section key returned by the routing callable)
+        are emitted within this file. Objects in sections not listed here follow the listed ones, in discovery order.
+        Sections only affect ordering; no sub-heading or separator is emitted between them.
+    """
+
+    filename: str
+    title: str | None = None
+    front_matter: dict[str, str] = field(default_factory=dict[str, str])
+    section_order: list[SectionKey] | None = None
+
+
+FileMetaProvider = "Mapping[RouteKey, FileMeta] | Callable[[RouteKey], FileMeta | None]"
+"Supplies metadata for routed output files, either as a mapping keyed by routing key, or as a callable."
+
+
+@dataclass
+class Section:
+    """
+    A group of documented objects within a single output file, emitted together.
+
+    :param key: The section key (or `None` for objects routed without an explicit section).
+    :param new_types: `NewType` aliases in this section, in discovery order.
+    :param classes: Classes, data-classes and enumerations in this section, in discovery order.
+    :param functions: Module-level functions in this section, in discovery order.
+    """
+
+    key: SectionKey | None
+    new_types: list[NewType] = field(default_factory=list)
+    classes: list[type] = field(default_factory=list)
+    functions: list[FunctionType] = field(default_factory=list)
+
+
+@dataclass
+class Bucket:
+    """
+    A group of documented objects routed to a single output file.
+
+    :param key: The routing key identifying the output file this bucket is emitted to.
+    :param sections: Sections within the file, keyed by section key (`None` for the default section),
+        in discovery order.
+    """
+
+    key: RouteKey
+    sections: dict[SectionKey | None, Section] = field(default_factory=dict[SectionKey | None, Section])
+
+    def section_for(self, section_key: SectionKey | None) -> Section:
+        "Returns the section for the given key, creating it (in discovery order) on first use."
+
+        section = self.sections.get(section_key)
+        if section is None:
+            section = Section(section_key)
+            self.sections[section_key] = section
+        return section
+
+
 @dataclass
 class Context:
     """
@@ -245,18 +370,24 @@ class Context:
 
     :param module: The module in which the types are defined.
     :param partition: Identifies the group of types.
+    :param router: When set, file identity is derived from routing keys rather than module name and partition.
     """
 
     module: ModuleType
     partition: ObjectKind | None
+    router: "Router | None" = None
 
     def name(self) -> str:
+        if self.router is not None:
+            return self.router.current_key
         if self.partition is not None:
             return f"{self.module.__name__}-{self.partition.value}"
         else:
             return self.module.__name__
 
     def matches(self, cls: ObjectType) -> bool:
+        if self.router is not None:
+            return self.router.key_of(cls) == self.router.current_key
         if cls.__module__ != self.module.__name__:
             return False
         if self.partition is None:
@@ -265,6 +396,11 @@ class Context:
         return self.partition is object_kind(cls)
 
     def path_to(self, cls: ObjectType | ModuleType) -> str:
+        if self.router is not None:
+            target = self.router.filename_of(cls)
+            source = self.router.filename_of_key(self.router.current_key)
+            return _relative_md_path(target, source)
+
         if self.partition is not None:
             kind = object_kind(cls)
         else:
@@ -278,6 +414,66 @@ class Context:
         target = Context(module, kind).name()
         source = self.name()
         return module_path(target, source)
+
+
+def _object_route_id(cls: NewType | ObjectType | ModuleType) -> tuple[str, str]:
+    "Stable identity for a documented object, used to look up its routed output file."
+
+    if isinstance(cls, ModuleType):
+        return (cls.__name__, "")
+    elif isinstance(cls, NewType):
+        return (cls.__module__, type_name(cls))
+    else:
+        return (cls.__module__, getattr(cls, "__qualname__", cls.__name__))
+
+
+class Router:
+    """
+    Resolves which routed output file each documented object belongs to.
+
+    The router owns the global bucket map (built in a first pass over all modules) and the file-metadata registry,
+    and is the single source of truth for cross-file link computation. The ``current_key`` attribute identifies the
+    file currently being written; it is updated as each bucket is emitted.
+    """
+
+    current_key: RouteKey
+
+    def __init__(
+        self,
+        buckets: dict[RouteKey, Bucket],
+        file_meta: Callable[[RouteKey], FileMeta | None],
+        object_keys: dict[tuple[str, str], RouteKey],
+        module_keys: dict[str, RouteKey],
+    ) -> None:
+        self._buckets = buckets
+        self._file_meta = file_meta
+        self._object_keys = object_keys
+        self._module_keys = module_keys
+        self.current_key = ""
+
+    def key_of(self, cls: NewType | ObjectType | ModuleType) -> RouteKey | None:
+        "Routing key of the output file that contains the given object, or `None` if it is not part of the output."
+
+        if isinstance(cls, ModuleType):
+            # modules do not route directly; map a module reference to a bucket it contributes to (if any)
+            return self._module_keys.get(cls.__name__)
+        return self._object_keys.get(_object_route_id(cls))
+
+    def filename_of_key(self, key: RouteKey) -> str:
+        "On-disk file name for a routing key, falling back to `<key>.md` when the key has no registry entry."
+
+        meta = self._file_meta(key)
+        if meta is not None and meta.filename:
+            return meta.filename
+        return f"{key}.md"
+
+    def filename_of(self, cls: ObjectType | ModuleType) -> str:
+        "On-disk file name of the output file that contains the given object."
+
+        key = self.key_of(cls)
+        if key is None:
+            raise KeyError(f"object is not part of the routed output: {cls!r}")
+        return self.filename_of_key(key)
 
 
 def module_anchor(module: ModuleType) -> str:
@@ -325,14 +521,14 @@ def _class_link(cls: ObjectType, context: Context, text: str | None = None) -> s
     return f"[{safe_name(text)}]({link})"
 
 
-def class_link(cls: type, context: Context) -> str:
+def class_link(cls: type, context: Context, text: str | None = None) -> str:
     "Markdown link with a partially- or fully-qualified class reference."
 
     assert not isinstance(cls, ModuleType) and not is_function(cls), f"expected: class reference; got: {type(cls).__name__}"  # type: ignore[unreachable]
-    return _class_link(cls, context)
+    return _class_link(cls, context, text=text)
 
 
-def new_type_link(cls: NewType, context: Context) -> str:
+def new_type_link(cls: NewType, context: Context, text: str | None = None) -> str:
     "Markdown link with a partially- or fully-qualified new type reference."
 
     qualname = f"{cls.__module__}.{type_name(cls)}"
@@ -345,7 +541,9 @@ def new_type_link(cls: NewType, context: Context) -> str:
         # non-local reference
         link = f"{context.path_to(cls)}{local_link}"
 
-    return f"[{safe_name(type_name(cls))}]({link})"
+    if text is None:
+        text = type_name(cls)
+    return f"[{safe_name(text)}]({link})"
 
 
 def function_anchor(fn: CallableType) -> str:
@@ -446,6 +644,13 @@ class MarkdownOptions:
     :param include_undocumented: Whether to include classes, functions and methods without a doc-string description.
     :param stdlib_links: Whether to include references for built-in types and types in the Python standard library.
     :param auxiliary_types: Maps each Python type (typically `Annotated[T, ...]`) to a human-readable name.
+    :param route: Maps each documented object to an output file key (or `None` to exclude it). When set, objects are
+        grouped into files by this key rather than by module, and `partition_strategy` is ignored. Cross-file links
+        are computed from this grouping. The file name, heading and front matter for each key come from the file
+        metadata registry passed as `files` to `MarkdownGenerator`.
+    :param qualify_cross_module_links: Whether to prefix the text of a link to another object with that object's
+        module short-name (e.g. `canvas.users` instead of `users`) when it is defined in a different module than the
+        referencing object. Links within the same module keep the short name. The link target is unaffected.
     """
 
     anchor_style: MarkdownAnchorStyle = MarkdownAnchorStyle.GITHUB
@@ -454,6 +659,8 @@ class MarkdownOptions:
     include_undocumented: bool = False
     stdlib_links: bool = True
     auxiliary_types: dict[object, str] = field(default_factory=dict[object, str])
+    route: RouteFn | None = None
+    qualify_cross_module_links: bool = False
 
 
 class ProcessingError(RuntimeError):
@@ -499,6 +706,9 @@ class MarkdownGenerator:
     modules: list[ModuleType]
     options: MarkdownOptions
     predicate: Callable[[ObjectType], bool] | None
+    route: RouteFn | None
+    files: Mapping[RouteKey, FileMeta] | Callable[[RouteKey], FileMeta | None] | None
+    _router: Router | None
 
     def __init__(
         self,
@@ -506,17 +716,41 @@ class MarkdownGenerator:
         *,
         options: MarkdownOptions | None = None,
         predicate: Callable[[ObjectType], bool] | None = None,
+        route: RouteFn | None = None,
+        files: Mapping[RouteKey, FileMeta] | Callable[[RouteKey], FileMeta | None] | None = None,
     ) -> None:
         """
         Instantiates a Markdown generator object.
 
         :param options: Options for generating Markdown output.
         :param predicate: If given, only those classes and functions are processed for which the predicate returns `True`.
+        :param route: Maps each documented object to an output file key (or `None` to exclude it). Overrides
+            `options.route` if both are given. When set, objects are grouped into files by key rather than by module,
+            and `options.partition_strategy` is ignored.
+        :param files: File-metadata registry for routed output, keyed by routing key (a mapping or callable returning
+            `FileMeta`). Supplies the file name, heading title and front matter for each routed file.
         """
 
         self.modules = modules
         self.options = options if options is not None else MarkdownOptions()
         self.predicate = predicate
+        self.route = route if route is not None else self.options.route
+        self.files = files
+        self._router = None
+
+    @property
+    def _routing_enabled(self) -> bool:
+        return self.route is not None
+
+    def _file_meta(self, key: RouteKey) -> FileMeta | None:
+        "Looks up file metadata for a routing key, normalizing the mapping/callable registry forms."
+
+        files = self.files
+        if files is None:
+            return None
+        if callable(files):
+            return files(key)
+        return files.get(key)
 
     def _heading_anchor(self, anchor: str, text: str) -> str:
         """
@@ -532,19 +766,52 @@ class MarkdownGenerator:
             case MarkdownAnchorStyle.GITBOOK:
                 return text + " {#" + anchor + "}"
 
+    def _is_in_batch(self, obj: ObjectType | ModuleType) -> bool:
+        """
+        True if a referenced object is part of the generated output, so a link should be emitted to it.
+
+        Without routing this means the object's module is one of the documented modules. With routing it additionally
+        requires the object to route to an output file (i.e. it was not excluded by the routing callable returning
+        `None`); an excluded object is treated like an external reference and rendered as plain text.
+        """
+
+        if isinstance(obj, ModuleType):
+            module = obj
+        else:
+            module = sys.modules[obj.__module__]
+        if module not in self.modules:
+            return False
+        if self._router is not None:
+            return self._router.key_of(obj) is not None
+        return True
+
     def _module_link(self, module: ModuleType, context: Context) -> str:
         "Creates a link to a class if it is part of the exported batch."
 
-        if module in self.modules:
+        if self._is_in_batch(module):
             return module_link(module, context)
         else:
             return safe_name(module.__name__)
 
+    def _link_text(self, obj: NewType | ObjectType, name: str, context: Context) -> str | None:
+        """
+        Computes custom link text for a reference, or `None` to use the default short name.
+
+        When `qualify_cross_module_links` is enabled, the text of a link to an object defined in a different module
+        than the referencing context is prefixed with the target object's module short-name (e.g. `canvas.users`).
+        """
+
+        if not self.options.qualify_cross_module_links:
+            return None
+        if obj.__module__ == context.module.__name__:
+            return None
+        module_short_name = obj.__module__.split(".")[-1]
+        return f"{module_short_name}.{name}"
+
     def _type_link(self, cls: NewType | type[Any], context: Context) -> str:
         if isinstance(cls, NewType):
-            module = sys.modules[cls.__module__]
-            if module in self.modules:
-                return new_type_link(cls, context)
+            if self._is_in_batch(cls):
+                return new_type_link(cls, context, text=self._link_text(cls, type_name(cls), context))
             else:
                 return safe_name(type_name(cls))
         else:
@@ -564,17 +831,15 @@ class MarkdownGenerator:
             qualname = f"{cls.__module__}.{cls.__qualname__}"
             return f"[{qualname}](https://docs.python.org/3/library/{cls.__module__}.html#{qualname})"
 
-        module = sys.modules[cls.__module__]
-        if module in self.modules:
-            return class_link(cls, context)
+        if self._is_in_batch(cls):
+            return class_link(cls, context, text=self._link_text(cls, cls.__name__, context))
         else:
             return safe_name(cls.__name__)
 
     def _decorator_link(self, fn: CallableType, context: Context) -> str:
         "Creates a link to a decorator function if it is part of the exported batch."
 
-        module = sys.modules[fn.__module__]
-        if module in self.modules:
+        if self._is_in_batch(fn):
             return decorator_link(fn, context)
         else:
             return f"@{safe_name(fn.__name__)}"
@@ -582,8 +847,7 @@ class MarkdownGenerator:
     def _function_link(self, fn: CallableType, context: Context) -> str:
         "Creates a link to a function if it is part of the exported batch."
 
-        module = sys.modules[fn.__module__]
-        if module in self.modules:
+        if self._is_in_batch(fn):
             return function_link(fn, context)
         else:
             return safe_name(fn.__name__)
@@ -654,6 +918,8 @@ class MarkdownGenerator:
         return text
 
     def _create_context(self, module: ModuleType, partition: ObjectKind) -> Context:
+        if self._router is not None:
+            return Context(module, None, router=self._router)
         match self.options.partition_strategy:
             case PartitionStrategy.SINGLE:
                 return Context(module, None)
@@ -842,6 +1108,14 @@ class MarkdownGenerator:
 
         self._generate_functions(cls, fmt, w)
 
+    def _generate_module_functions(self, module: ModuleType, functions: list[FunctionType], w: MarkdownWriter) -> None:
+        "Writes Markdown output for a group of module-level functions defined in a single module."
+
+        context = self._create_context(module, ObjectKind.FUNCTION)
+        fmt = MarkdownTypeFormatter(module, lambda c: self._type_link(c, context), self.options.auxiliary_types)
+        for func in functions:
+            self._generate_function(func, ModuleResolver(module), ModuleFunctionResolver(func), context, fmt, w)
+
     def _generate_module(self, module: ModuleType, target: Path, partition: ObjectKind | None) -> None:
         "Writes Markdown output for a single Python module."
 
@@ -929,12 +1203,202 @@ class MarkdownGenerator:
                 f.write("\n")
                 f.write(w.fetch())
 
+    def _collect_buckets(self) -> dict[RouteKey, Bucket]:
+        """
+        First routing pass: assigns every documented object to an output-file bucket.
+
+        Walks all modules, applies the same visibility filters as module-based generation, then calls the routing
+        callable. Objects routed to `None` are excluded. Returns buckets keyed by routing key, in discovery order.
+        """
+
+        assert self.route is not None
+        buckets: dict[RouteKey, Bucket] = {}
+        seen: set[int] = set()
+
+        def bucket_for(key: RouteKey) -> Bucket:
+            bucket = buckets.get(key)
+            if bucket is None:
+                bucket = Bucket(key)
+                buckets[key] = bucket
+            return bucket
+
+        for module in self.modules:
+            for nt in get_module_new_types(module):
+                routed = self.route(nt)
+                if routed is None or id(nt) in seen:
+                    continue
+                seen.add(id(nt))
+                file_key, section_key = _split_routed_key(routed)
+                bucket_for(file_key).section_for(section_key).new_types.append(nt)
+
+            for cls in get_module_classes(module):
+                if not self.options.include_private and is_private(cls):
+                    continue
+                if self.predicate is not None and not self.predicate(cls):
+                    continue
+                routed = self.route(cls)
+                if routed is None or id(cls) in seen:
+                    continue
+                seen.add(id(cls))
+                file_key, section_key = _split_routed_key(routed)
+                bucket_for(file_key).section_for(section_key).classes.append(typing.cast(type, cls))  # type: ignore[redundant-cast]
+
+            functions = get_module_functions(module)
+            if not self.options.include_private:
+                functions = [fn for fn in functions if not is_private(fn)]
+            if not self.options.include_undocumented:
+                functions = [fn for fn in functions if is_documented(fn)]
+            for func in functions:
+                routed = self.route(func)
+                if routed is None or id(func) in seen:
+                    continue
+                seen.add(id(func))
+                file_key, section_key = _split_routed_key(routed)
+                bucket_for(file_key).section_for(section_key).functions.append(func)
+
+        return buckets
+
+    def _build_router(self, buckets: dict[RouteKey, Bucket]) -> Router:
+        "Builds the routing lookup tables (object identity → key, module name → a key it contributes to)."
+
+        object_keys: dict[tuple[str, str], RouteKey] = {}
+        module_keys: dict[str, RouteKey] = {}
+        for key, bucket in buckets.items():
+            seen_anchors: set[str] = set()
+
+            def register(obj: NewType | ObjectType, anchor: str, *, key: RouteKey = key, seen: set[str] = seen_anchors) -> None:
+                object_keys[_object_route_id(obj)] = key
+                module_keys.setdefault(obj.__module__, key)
+                if anchor in seen:
+                    logging.warning("duplicate anchor %r in output file %r; links to it may be ambiguous", anchor, key)
+                seen.add(anchor)
+
+            # links resolve to the output FILE, not the section, so register every object to the file key
+            for section in bucket.sections.values():
+                for nt in section.new_types:
+                    register(nt, new_type_anchor(nt))
+                for kls in section.classes:
+                    register(kls, class_anchor(kls))
+                for func in section.functions:
+                    register(func, function_anchor(func))
+        return Router(buckets, self._file_meta, object_keys, module_keys)
+
+    def _generate_bucket(self, bucket: Bucket, target: Path) -> None:
+        "Second routing pass: writes a single routed output file from a bucket of objects."
+
+        assert self._router is not None
+        meta = self._file_meta(bucket.key)
+
+        header = MarkdownWriter()
+        if meta is not None and meta.front_matter:
+            header.print("---")
+            for fm_key, fm_value in meta.front_matter.items():
+                header.print(f"{_yaml_scalar(fm_key)}: {_yaml_scalar(fm_value)}")
+            header.print("---")
+            header.print()
+
+        title = meta.title if meta is not None and meta.title is not None else bucket.key
+        header.print(f"# {self._heading_anchor(safe_id(bucket.key), title)}")
+        header.print()
+
+        w = MarkdownWriter()
+        for section in self._ordered_sections(bucket, meta):
+            self._emit_section_objects(section, w)
+
+        if w:
+            os.makedirs(target.parent, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(header.fetch())
+                f.write("\n")
+                f.write(w.fetch())
+
+    def _ordered_sections(self, bucket: Bucket, meta: FileMeta | None) -> list[Section]:
+        "Returns the bucket's sections in emission order: declared `section_order` first, then any remaining ones."
+
+        if meta is None or meta.section_order is None:
+            return list(bucket.sections.values())
+
+        ordered: list[Section] = []
+        emitted: set[SectionKey | None] = set()
+        for declared_key in meta.section_order:
+            section = bucket.sections.get(declared_key)
+            if section is not None:
+                ordered.append(section)
+                emitted.add(declared_key)
+        for section_key, section in bucket.sections.items():
+            if section_key not in emitted:
+                if section_key is not None:
+                    logging.warning("section %r in file %r is not listed in section_order; emitting it last", section_key, bucket.key)
+                ordered.append(section)
+        return ordered
+
+    def _emit_section_objects(self, section: Section, w: MarkdownWriter) -> None:
+        "Writes a section's new types, classes and module-level functions, in that order."
+
+        for nt in section.new_types:
+            module = sys.modules[nt.__module__]
+            context = self._create_context(module, ObjectKind.MODULE)
+            w.print(f"## {self._heading_anchor(new_type_anchor(nt), safe_name(type_name(nt)))}")
+            w.print()
+            w.print(f"**Supertype:** {self._type_link(nt.__supertype__, context)}")
+
+        for kls in section.classes:
+            w.print(f"## {self._heading_anchor(class_anchor(kls), safe_name(kls.__name__))}")
+            w.print()
+            try:
+                if is_type_enum(kls):
+                    self._generate_enum(kls, w)
+                elif is_dataclass(kls):
+                    self._generate_dataclass(kls, w)
+                elif isinstance(kls, type):
+                    self._generate_class(kls, w)
+                else:
+                    raise TypeError(f"expected: data-class, enum class or regular class; got: {kls}")
+            except Exception as e:
+                raise ProcessingError(
+                    f"error while processing type `{kls.__name__}` in module `{kls.__module__}`",
+                    obj=kls,
+                ) from e
+
+        # group functions by their defining module so the context and type formatter are created once per module
+        functions_by_module: dict[str, list[FunctionType]] = {}
+        for func in section.functions:
+            functions_by_module.setdefault(func.__module__, []).append(func)
+        for module_name, module_functions in functions_by_module.items():
+            module = sys.modules[module_name]
+            self._generate_module_functions(module, module_functions, w)
+
+    def _generate_routed(self, target: Path) -> None:
+        "Generates Markdown output grouped into files by the routing callable."
+
+        buckets = self._collect_buckets()
+        self._router = self._build_router(buckets)
+        try:
+            filenames: dict[str, RouteKey] = {}
+            for key, bucket in buckets.items():
+                self._router.current_key = key
+                filename = self._router.filename_of_key(key)
+                if Path(filename).is_absolute() or ".." in Path(filename).parts:
+                    raise ValueError(f"invalid output file name for routing key {key!r}: {filename!r}")
+                if filename in filenames and filenames[filename] != key:
+                    raise ValueError(f"routing keys {filenames[filename]!r} and {key!r} map to the same file {filename!r}")
+                filenames[filename] = key
+                self._generate_bucket(bucket, target / Path(filename))
+        finally:
+            self._router = None
+
     def generate(self, target: Path) -> None:
         """
         Writes Markdown files to a target directory.
 
-        The subdirectories that files are written to match the hierarchy of the Python modules.
+        Without routing, one file is written per module (or per module and kind under `BY_KIND`), and the
+        subdirectories that files are written to match the hierarchy of the Python modules. With a routing callable
+        set, objects are grouped into files by routing key instead.
         """
+
+        if self._routing_enabled:
+            self._generate_routed(target)
+            return
 
         for module in self.modules:
             module_path = module.__name__.replace(".", "/") + ".md"

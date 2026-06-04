@@ -9,3 +9,4 @@ $PYTHON_EXECUTABLE -m mypy markdown_doc
 
 # Run unit tests
 $PYTHON_EXECUTABLE check.py
+$PYTHON_EXECUTABLE check_routing.py
